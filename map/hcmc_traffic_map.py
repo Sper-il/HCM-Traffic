@@ -12,7 +12,6 @@ from datetime import datetime, timedelta
 import numpy as np
 import math
 import gzip
-import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 
@@ -134,32 +133,41 @@ def calculate_total_length_parallel(edges, max_workers=4):
     if len(edges) == 0:
         return 0.0
 
-    # Chuyển đổi edges thành danh sách để xử lý song song
-    edges_list = []
-    for idx, row in edges.iterrows():
-        if hasattr(row.geometry, 'coords'):
-            try:
-                coords = [(lat, lon) for lon, lat in row.geometry.coords]
-                if len(coords) >= 2:
-                    edges_list.append(coords)
-            except:
-                continue
-
-    if not edges_list:
-        return 0.0
-
-    # Sử dụng ThreadPoolExecutor để tính toán song song
     total_length_m = 0.0
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Gửi các task tính toán
-        future_to_coords = {executor.submit(calculate_route_length_fast, coords): coords for coords in edges_list}
 
-        # Thu thập kết quả
-        for future in as_completed(future_to_coords):
-            try:
-                total_length_m += future.result()
-            except Exception:
-                continue
+    # Sử dụng progress bar cho các khu vực lớn
+    if len(edges) > 1000:
+        progress_bar = st.progress(0)
+
+    try:
+        # Sử dụng ThreadPoolExecutor để tính toán song song
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Tạo danh sách các tọa độ để tính toán
+            futures = []
+            for idx, row in edges.iterrows():
+                if hasattr(row.geometry, 'coords'):
+                    try:
+                        coords = [(lat, lon) for lon, lat in row.geometry.coords]
+                        if len(coords) >= 2:
+                            futures.append(executor.submit(calculate_route_length_fast, coords))
+                    except:
+                        continue
+
+            # Thu thập kết quả
+            for i, future in enumerate(as_completed(futures)):
+                try:
+                    total_length_m += future.result()
+                except Exception:
+                    continue
+
+                # Cập nhật progress bar
+                if len(edges) > 1000 and (i % 100 == 0 or i == len(futures) - 1):
+                    progress = (i + 1) / len(futures)
+                    progress_bar.progress(progress)
+
+    finally:
+        if len(edges) > 1000:
+            progress_bar.empty()
 
     return total_length_m / 1000  # Chuyển sang km
 
@@ -329,7 +337,15 @@ class CacheManager:
                 with open(cache_file_path, 'rb') as f:
                     return pickle.load(f)
         except Exception as e:
-            st.warning(f"⚠️ Lỗi khi đọc cache: {e}")
+            # Xóa cache bị lỗi để tạo lại
+            try:
+                os.remove(cache_file_path)
+                meta_path = CacheManager.get_metadata_file_path(cache_key)
+                if os.path.exists(meta_path):
+                    os.remove(meta_path)
+            except:
+                pass
+            st.warning(f"⚠️ Cache bị lỗi, đã xóa và sẽ tải lại: {e}")
             return None
 
     @staticmethod
@@ -378,14 +394,17 @@ class CacheManager:
             return "empty"
 
         # Tạo hash từ các thuộc tính cơ bản của edges
-        hash_data = {
-            'shape': edges.shape,
-            'total_length': edges.attrs.get('total_length_km', 0) if hasattr(edges, 'attrs') else 0,
-            'columns': list(edges.columns) if hasattr(edges, 'columns') else [],
-            'count': len(edges)
-        }
+        try:
+            hash_data = {
+                'shape': edges.shape,
+                'total_length': edges.attrs.get('total_length_km', 0) if hasattr(edges, 'attrs') else 0,
+                'columns': list(edges.columns) if hasattr(edges, 'columns') else [],
+                'count': len(edges)
+            }
 
-        return hashlib.md5(json.dumps(hash_data, sort_keys=True).encode()).hexdigest()
+            return hashlib.md5(json.dumps(hash_data, sort_keys=True, default=str).encode()).hexdigest()
+        except:
+            return "error"
 
 
 def get_graph_data(place_name, detailed=False):
@@ -425,7 +444,7 @@ def get_graph_data(place_name, detailed=False):
                     _MEMORY_CACHE[cache_key] = (edges, metadata)
 
                     st.success(
-                        f"✅ Đã tải từ cache: {len(edges)} tuyến đường (kích thước: {metadata.get('size_kb', 0):.1f} KB)")
+                        f"✅ Đã tải từ cache: {len(edges)} tuyến đường")
                     return edges
         except Exception as e:
             st.warning(f"⚠️ Lỗi khi đọc cache: {e}. Đang tải mới từ internet...")
@@ -453,7 +472,7 @@ def download_and_cache_data(place_name, detailed, cache_key, compressed=True):
         custom_filter = '["highway"~"motorway|trunk|primary|secondary|tertiary"]'
 
     try:
-        with st.spinner(f"🌐 Đang tải dữ liệu từ OpenStreetMap..."):
+        with st.spinner(f"🌐 Đang tải dữ liệu từ OpenStreetMap cho {place_name}..."):
             if custom_filter:
                 G = ox.graph_from_place(
                     place_name,
@@ -492,7 +511,7 @@ def download_and_cache_data(place_name, detailed, cache_key, compressed=True):
             _MEMORY_CACHE[cache_key] = (edges, metadata)
 
             st.success(
-                f"💾 Đã lưu cache: {len(edges)} tuyến đường, {total_length_km:.1f} km (kích thước: {metadata['size_kb']:.1f} KB)")
+                f"💾 Đã lưu cache: {len(edges)} tuyến đường, {total_length_km:.1f} km")
 
         return edges
 
@@ -601,9 +620,7 @@ class HCMTrafficMap:
         st.sidebar.markdown(f"### 📊 Thông tin Cache")
         st.sidebar.markdown(f"**Số khu vực:** {len(self.cache_info)}")
         st.sidebar.markdown(f"**Số bản đồ:** {folium_cache_count}")
-        st.sidebar.markdown(f"**Đã nén:** {compressed_count}/{len(self.cache_info)}")
-        st.sidebar.markdown(f"**Dung lượng dữ liệu:** {total_size:.1f} KB")
-        st.sidebar.markdown(f"**Dung lượng bản đồ:** {folium_cache_size:.1f} KB")
+        st.sidebar.markdown(f"**Tổng dung lượng:** {(total_size + folium_cache_size):.1f} KB")
         st.sidebar.markdown(f"**Tổng chiều dài:** {total_length:.1f} km")
 
         # Hiển thị danh sách cache
@@ -869,7 +886,8 @@ class HCMTrafficMap:
         total_displayed_length = 0.0
 
         # Sử dụng progress bar để hiển thị tiến trình vẽ
-        progress_bar = st.progress(0)
+        if len(edges) > 1000:
+            progress_bar = st.progress(0)
         total_edges = min(len(edges), max_edges)
 
         # Vẽ các tuyến đường với tối ưu hóa
@@ -928,14 +946,15 @@ class HCMTrafficMap:
                     count += 1
 
                     # Cập nhật progress bar mỗi 1000 đường
-                    if count % 1000 == 0 or count == total_edges:
+                    if len(edges) > 1000 and (count % 1000 == 0 or count == total_edges):
                         progress = count / total_edges
                         progress_bar.progress(progress)
 
             except Exception:
                 continue
 
-        progress_bar.empty()  # Ẩn progress bar sau khi hoàn thành
+        if len(edges) > 1000:
+            progress_bar.empty()  # Ẩn progress bar sau khi hoàn thành
 
         # Thêm marker cho trung tâm thành phố nếu là Quận 1
         if "District 1" in str(edges.crs) if edges.crs else False:
